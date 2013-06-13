@@ -41,9 +41,7 @@ class Servlet31ConnectorServlet extends HttpServlet {
     def requestStringForLog: String = "%s request to '%s'" format(hsRequest.getMethod, ModelConverter.rebuildUri(hsRequest))
     val asyncContext = hsRequest.startAsync()
     asyncContext.setTimeout(settings.requestTimeout.toMillis)
-    val asyncContextListener = new AsyncContextListener(asyncContext, requestStringForLog)
-    asyncContext.addListener(asyncContextListener)
-    asyncContext.start(new RunAsync(asyncContext, requestStringForLog, asyncContextListener))
+    asyncContext.addListener(new AsyncContextListener(asyncContext, requestStringForLog))
   }
 
   /**
@@ -55,7 +53,7 @@ class Servlet31ConnectorServlet extends HttpServlet {
                                      private val requestStringForLog: String) extends AsyncListener {
 
     /**
-     * RunAsync should be run quick enough for this to be set before a timeout.
+     * onStartAsync should be run quick enough for this to be set before a timeout.
      */
     var responder: Responder = null
 
@@ -81,41 +79,24 @@ class Servlet31ConnectorServlet extends HttpServlet {
     }
 
     /**
-     * We do nothing here.
-     * @param event start async event data.
+     * Parse request headers and hooks to read listener. Responder will take charge once read is completed.
+     * @param event startAsync event data.
      */
-    def onStartAsync(event: AsyncEvent) {} // what if we run RunAsync#run() instead?
+    def onStartAsync(event: AsyncEvent) {
+      val hsRequest = asyncContext.getRequest.asInstanceOf[HttpServletRequest]
+      val futureRequest = ModelConverter.toHttpRequest(hsRequest)
+      responder = new Responder(system, log, settings, asyncContext, requestStringForLog,
+        futureRequest, serviceActor)
+    }
 
     /**
      * We do nothing here.
      * @param event complete event data.
      */
-
-    def onComplete(event: AsyncEvent) {} // maybe log?
-
-  }
-
-  /**
-   * Runnable that builds the Spray Request and the Responder.
-   * Will run in a thread designated by the servlet container.
-   * @param asyncContext the context this block of code belongs to.
-   * @param requestStringForLog friendly string that represents the request. Used for logging.
-   * @param asyncContextListener listener to set the responder.
-   */
-  private class RunAsync(private val asyncContext: AsyncContext,
-                         private val requestStringForLog: String,
-                         private val asyncContextListener: AsyncContextListener) extends Runnable {
-
-    /**
-     * Parse request headers and hooks to read listener. Once read is compl
-     */
-    def run() {
-      val hsRequest = asyncContext.getRequest.asInstanceOf[HttpServletRequest]
-      val futureRequest = ModelConverter.toHttpRequest(hsRequest)
-      val responder = new Responder(system, log, settings, asyncContext, requestStringForLog,
-        futureRequest, serviceActor)
-      asyncContextListener.responder = responder
+    def onComplete(event: AsyncEvent) {
+      log.debug("onComplete event of {}", requestStringForLog)
     }
+
   }
 
   /**

@@ -55,16 +55,16 @@ private[servlet31] class Responder(system: ActorSystem, log: LoggingAdapter, set
    */
   private def requestStringForLog: String = theRequest.map(_.toString).getOrElse(requestString)
 
-  private val queue: ConcurrentLinkedQueue[(ByteArrayInputStream, Option[PostProcessMessage], String)] =
-    new ConcurrentLinkedQueue[(ByteArrayInputStream, Option[PostProcessMessage], String)]
+  private val queue: ConcurrentLinkedQueue[(ByteArrayInputStream, PostProcessMessage, String)] =
+    new ConcurrentLinkedQueue[(ByteArrayInputStream, PostProcessMessage, String)]
 
 
   /**
-   * The first time {@link WriteListener#onWritePossible() } is called, we need to extract
-   * the request data from the Future. I know it will be completed because
-   * the listener is set at {@link Future#onComplete() }.
+   * The first time data arrives and the queue is filled with something,
+   * we hook the listener so it can start moving data from the queue to the OutputStream
+   * whenever the Servlet Container wants.
    */
-  private val firstTime = new AtomicBoolean(true)
+  private val writeListenerSet = new AtomicBoolean(false)
 
   /**
    * Servlet response.
@@ -89,19 +89,11 @@ private[servlet31] class Responder(system: ActorSystem, log: LoggingAdapter, set
      * pass it to spray routing.
      */
     def onWritePossible() {
-      if (firstTime.get()) {
-        firstTime.set(false)
-        processRequestFromFuture()
-      } else {
-        tryWriteFromQueue()
-      }
+      tryWriteFromQueue()
     }
   }
 
-  //TODO maybe set the listener after the first response from spray routing.
-  futureRequest.onComplete({
-    case _ => hsResponse.getOutputStream.setWriteListener(writeListener)
-  })(system.dispatcher)
+  futureRequest.onComplete(processRequestFromFuture)(system.dispatcher)
 
   /**
    * The timeout duration can vary with a call to SetTimeout
@@ -115,8 +107,7 @@ private[servlet31] class Responder(system: ActorSystem, log: LoggingAdapter, set
    */
   private def nullAsEmpty(s: String): String = if (s == null) "" else s
 
-  private def processRequestFromFuture() {
-      val successOrFailure: Try[HttpRequest] = futureRequest.value.get
+  private def processRequestFromFuture(successOrFailure: Try[HttpRequest]) {
     successOrFailure match {
       case Success(request: HttpRequest) ⇒ {
         theRequest = Some(request)
@@ -126,61 +117,86 @@ private[servlet31] class Responder(system: ActorSystem, log: LoggingAdapter, set
         case e: IllegalRequestException ⇒ {
           log.warning("Illegal request {}\n\t{}\n\tCompleting with '{}' response",
             requestStringForLog, e.info.formatPretty, e.status)
-          writeResponse(HttpResponse(e.status, e.info.format(settings.verboseErrorMessages)))
+          writeResponse(HttpResponse(e.status, e.info.format(settings.verboseErrorMessages)), PostProcessMessage(close = true))
         }
         case e: RequestProcessingException ⇒ {
           log.warning("Request {} could not be handled normally\n\t{}\n\tCompleting with '{}' response",
             requestStringForLog, e.info.formatPretty, e.status)
-          writeResponse(HttpResponse(e.status, e.info.format(settings.verboseErrorMessages)))
+          writeResponse(HttpResponse(e.status, e.info.format(settings.verboseErrorMessages)), PostProcessMessage(close = true))
         }
         case NonFatal(e) ⇒ {
           log.error(e, "Error during processing of request {}", requestStringForLog)
-          writeResponse(HttpResponse(500, entity = "The request could not be handled"))
+          writeResponse(HttpResponse(500, entity = "The request could not be handled"), PostProcessMessage(close = true))
         }
       }
 
     }
   }
 
+  /**
+   * If there is data in the queue, try to write it to the response OutputStream, while it's ready.
+   */
   private def tryWriteFromQueue() {
     if (!queue.isEmpty) {
-      val (byteInputStream, postProcessMessage, responseString) = queue.peek()
-      var error: Option[Throwable] = None
-      try {
+      val (byteInputStream, postProcessMessage, responseAsStringForLog) = queue.peek()
+      val tryToWrite: Try[Unit] = Try {
         while (hsResponse.getOutputStream.isReady && byteInputStream.available > 0) {
           hsResponse.getOutputStream.write(byteInputStream.read())
         }
-      } catch {
-        case e: IOException ⇒
-          log.error("Could not write response body, probably the request has either timed out or the client has " +
-            "disconnected\nRequest: {}\nResponse: {}\nError: {}", requestStringForLog, responseString, e)
-          error = Some(e)
-        case NonFatal(e) ⇒
-          log.error("Could not complete request\nRequest: {}\nResponse: {}\nError: {}", requestStringForLog, responseString, e)
-          error = Some(e)
       }
-      if (error.isDefined || byteInputStream.available() == 0) {
+      tryToWrite match {
+        case Failure(e) ⇒ e match {
+          case ioe: IOException ⇒
+            log.error("Could not write response body, probably the request has either timed out or the client has " +
+              "disconnected\nRequest: {}\nResponse: {}\nError: {}",
+              requestStringForLog, responseAsStringForLog, ioe)
+          case another ⇒
+            log.error("Could not complete request\nRequest: {}\nResponse: {}\nError: {}",
+              requestStringForLog, responseAsStringForLog, another)
+        }
+      }
+      //val error: Option[Throwable] = (tryToWrite map {case _ => None} recover { case t => Some(t)}).toOption.flatten
+
+      if (tryToWrite.isFailure || byteInputStream.available() == 0) {
         queue.poll()
-        if (postProcessMessage.isDefined) {
-          if (postProcessMessage.get.completeContext) asyncContext.complete()
-          postProcess(error, postProcessMessage.get)
+        postProcess(tryToWrite, postProcessMessage)
+      }
+    }
+  }
+
+  /**
+   * Defines what to do after some data has been written to the stream.
+   * @param ack if something, send it back to the sender.
+   * @param close if true, close the stream (complete) and tell the sender that we are closed.
+   * @param sender the actor that sent us the data.
+   */
+  private case class PostProcessMessage(close: Boolean, sender: Option[ActorRef] = None, ack: Option[Any] = None)
+
+  private def postProcess(error: Try[_], postProcessMessage: PostProcessMessage) {
+    error match {
+      case Success(_) ⇒ {
+        postProcessMessage.ack.foreach(ack => postProcessMessage.sender.foreach(sender => sender.tell(ack, this)))
+        if (postProcessMessage.close) {
+          asyncContext.complete()
+          if (postProcessMessage.sender.isDefined) {
+            postProcessMessage.sender.get.tell(Tcp.Closed, this)
+          }
+        }
+      }
+      case Failure(e) ⇒ {
+        asyncContext.complete()
+        if (postProcessMessage.sender.isDefined) {
+          postProcessMessage.sender.get.tell(Tcp.ErrorClosed(nullAsEmpty(e.getMessage)), this)
         }
       }
     }
   }
 
-  private case class PostProcessMessage(completeContext: Boolean, ack: Option[Any], close: Boolean, sender: ActorRef)
-  private def postProcess(error: Option[Throwable], postProcessMessage: PostProcessMessage) {
-    error match {
-      case None ⇒
-        postProcessMessage.ack.foreach(postProcessMessage.sender.tell(_, this))
-        if (postProcessMessage.close) postProcessMessage.sender.tell(Tcp.Closed, this)
-      case Some(e) ⇒
-        postProcessMessage.sender.tell(Tcp.ErrorClosed(nullAsEmpty(e.getMessage)), this)
-        asyncContext.complete()
-    }
-  }
-
+  /**
+   * Method to handle messages that this Actor receives.
+   * @param message an actor message.
+   * @param sender the actor that sent the message.
+   */
   def handle(message: Any)(implicit sender: ActorRef) {
     val trueSender = sender
     message match {
@@ -188,7 +204,7 @@ private[servlet31] class Responder(system: ActorSystem, log: LoggingAdapter, set
         wrapper.messagePart.asInstanceOf[HttpResponsePart] match {
           case response: HttpResponse ⇒
             if (state.compareAndSet(OPEN, COMPLETED)) {
-              writeResponse(response, Some(PostProcessMessage(completeContext = true, wrapper.ack, close = true, trueSender)))
+              writeResponse(response, PostProcessMessage(close = true, Some(trueSender), wrapper.ack))
             } else state.get match {
               case STARTED ⇒
                 log.warning("Received an HttpResponse after a ChunkedResponseStart, dropping ...\nRequest: {}\nResponse: {}", requestStringForLog, response)
@@ -198,7 +214,7 @@ private[servlet31] class Responder(system: ActorSystem, log: LoggingAdapter, set
 
           case response: ChunkedResponseStart ⇒
             if (state.compareAndSet(OPEN, STARTED)) {
-              writeResponse(response, Some(PostProcessMessage(completeContext = false, wrapper.ack, close = false, trueSender)))
+              writeResponse(response, PostProcessMessage(close = false, Some(trueSender), wrapper.ack))
             } else state.get match {
               case STARTED ⇒
                 log.warning("Received a second ChunkedResponseStart, dropping ...\nRequest: {}\nResponse: {}", requestStringForLog, response)
@@ -210,14 +226,14 @@ private[servlet31] class Responder(system: ActorSystem, log: LoggingAdapter, set
             case OPEN ⇒
               log.warning("Received a MessageChunk before a ChunkedResponseStart, dropping ...\nRequest: {}\nChunk: {} bytes\n", requestStringForLog, body.length)
             case STARTED ⇒
-              writeChunk(body, hsResponse, PostProcessMessage(completeContext = false, wrapper.ack, close = false, trueSender))
+              writeChunk(body, PostProcessMessage(close = false, Some(trueSender), wrapper.ack))
             case COMPLETED ⇒
               log.warning("Received a MessageChunk for a request that was already completed, dropping ...\nRequest: {}\nChunk: {} bytes", requestStringForLog, body.length)
           }
 
           case _: ChunkedMessageEnd ⇒
             if (state.compareAndSet(STARTED, COMPLETED)) {
-              closeResponseStream(hsResponse, wrapper.ack, trueSender)
+              postProcess(Success(), PostProcessMessage(close = true, Some(trueSender), wrapper.ack))
             } else state.get match {
               case OPEN ⇒
                 log.warning("Received a ChunkedMessageEnd before a ChunkedResponseStart, dropping ...\nRequest: {}", requestStringForLog)
@@ -244,33 +260,27 @@ private[servlet31] class Responder(system: ActorSystem, log: LoggingAdapter, set
     }
   }
 
+  /**
+   * Log that a message came but the response was already committed.
+   * @param msg the unwanted message.
+   */
   private def notCompleted(msg: Any) {
-    log.warning("Received a {} for a request that was already completed, dropping ...\nRequest: {}", msg, requestStringForLog)
+    log.warning("Received a {} for a request that was already completed, dropping ...\nRequest: {}",
+      msg, requestStringForLog)
   }
 
-  private def writeChunk(buffer: Array[Byte], hsResponse: HttpServletResponse, postProcessMessage: PostProcessMessage) {
-    queue.add((new ByteArrayInputStream(buffer), Some(postProcessMessage), hsResponse.toString))
+  /**
+   * Write a chunk of data to the queue, and maybe to the OutputStream if it's ready.
+   * @param buffer data
+   * @param postProcessMessage defines what to do after the data is sent to the stream.
+   */
+  private def writeChunk(buffer: Array[Byte], postProcessMessage: PostProcessMessage) {
+    queue.add((new ByteArrayInputStream(buffer), postProcessMessage, hsResponse.toString))
     tryWriteFromQueue()
   }
 
-  private def closeResponseStream(hsResponse: HttpServletResponse, ack: Option[Any], sender: ActorRef) {
-    var error: Option[Throwable] = None
-    try {
-      asyncContext.complete()
-    } catch {
-      case e: IOException ⇒
-        log.error("Could not close response stream, probably the request has either timed out or the client has " +
-          "disconnected\nRequest: {}\nError: {}", requestStringForLog, e)
-        error = Some(e)
-      case NonFatal(e) ⇒
-        log.error("Could not close response stream\nRequest: {}\nError: {}", requestStringForLog, e)
-        error = Some(e)
-    }
-    postProcess(error, PostProcessMessage(completeContext = false, ack, close = true, sender))
-  }
-
   private def writeResponse(response: HttpMessageStart with HttpResponsePart,
-                    postProcessMessage: Option[PostProcessMessage] = None) {
+                    postProcessMessage: PostProcessMessage) {
 
     val resp = response.message.asInstanceOf[HttpResponse]
     hsResponse.setStatus(resp.status.intValue)
@@ -282,39 +292,51 @@ private[servlet31] class Responder(system: ActorSystem, log: LoggingAdapter, set
           case _ ⇒ hsResponse.addHeader(header.name, header.value)
         }
     }
-      resp.entity match {
-        case EmptyEntity ⇒ {
-          if (postProcessMessage.isDefined) {
-            if (postProcessMessage.get.completeContext) asyncContext.complete()
-            postProcess(None, postProcessMessage.get)
-          }
-        }
-        case HttpBody(contentType, buffer) ⇒ {
-          hsResponse.addHeader("Content-Type", contentType.value)
-          if (response.isInstanceOf[HttpResponse]) hsResponse.addHeader("Content-Length", buffer.length.toString)
-          queue.add((new ByteArrayInputStream(buffer), postProcessMessage, response.toString))
+    resp.entity match {
+      case EmptyEntity ⇒ {
+        postProcess(Success(), postProcessMessage)
+      }
+      case HttpBody(contentType, buffer) ⇒ {
+        hsResponse.addHeader("Content-Type", contentType.value)
+        if (response.isInstanceOf[HttpResponse]) hsResponse.addHeader("Content-Length", buffer.length.toString)
+        queue.add((new ByteArrayInputStream(buffer), postProcessMessage, response.toString))
+
+        if (!writeListenerSet.get()) {
+          writeListenerSet.set(true)
+          hsResponse.getOutputStream.setWriteListener(writeListener)
+        } else {
           tryWriteFromQueue()
         }
+
+
       }
+    }
   }
 
+  /**
+   * public method to be called by AsyncListener.
+   * @param timeoutHandler actor to tell that a timeOut happened.
+   */
   def callTimeout(timeoutHandler: ActorRef) {
     val timeOutResponder = new UnregisteredActorRef(system) {
       def handle(message: Any)(implicit sender: ActorRef) {
         message match {
-          case x: HttpResponse ⇒ writeResponse(x, None)
+          case x: HttpResponse ⇒ writeResponse(x, PostProcessMessage(close = false))
           case x ⇒ system.eventStream.publish(UnhandledMessage(x, sender, this))
         }
       }
     }
 
-    writeResponse(timeoutResponse(), None)
+    writeResponse(timeoutResponse(), PostProcessMessage(close = false))
     if (timeoutTimeout.isFinite() && theRequest.isDefined) {
       timeoutHandler.tell(Timedout(theRequest.get), timeOutResponder)
     }
 
   }
 
+  /**
+   * @return a Timeout Response to send to the client.
+   */
   private def timeoutResponse(): HttpResponse = HttpResponse(
     status = 500,
     entity = "Ooops! The server was not able to produce a timely response to your request.\n" +

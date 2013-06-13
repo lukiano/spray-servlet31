@@ -8,7 +8,7 @@ import spray.http.parser.HttpParser
 import spray.http._
 import HttpHeaders._
 import StatusCodes._
-import javax.servlet.ReadListener
+import javax.servlet.{ServletInputStream, ReadListener}
 import spray.servlet.ConnectorSettings
 import scala.concurrent.{Promise, Future}
 import java.util.concurrent.atomic.AtomicInteger
@@ -39,61 +39,46 @@ private[servlet31] object ModelConverter {
       case (result, _)                        ⇒ result
     }
 
-    if (contentLength.isDefined && contentLength.get > settings.maxContentLength)
+    if (contentLength.fold(false)(_ > settings.maxContentLength))
       throw new IllegalRequestException(RequestEntityTooLarge, ErrorInfo("HTTP message Content-Length " +
       contentLength.get + " exceeds the configured limit of " + settings.maxContentLength))
-
 
     val promise = Promise[HttpRequest]()
     val inputStream = hsRequest.getInputStream
     val readListener = new ReadListener {
 
-      val buf:Either[Array[Byte], ByteArrayOutputStream] = if (contentLength.isDefined && contentLength.get > 0)
-        Left(new Array[Byte](contentLength.get))
-      else
-        Right(new ByteArrayOutputStream())
+      val buffer = if (contentLength.fold(false)(_ > 0))
+        new StaticBuffer(contentLength.get) else new DynamicBuffer
 
-      var bytesRead: AtomicInteger = new AtomicInteger(0)
-
-      def fillLeftBuffer() {
-        while (inputStream.isReady) {
-          buf.left.get(bytesRead.get) = inputStream.read().toByte
-          bytesRead.incrementAndGet()
-          if (bytesRead.get > contentLength.get) {
-            val e  = new RequestProcessingException(InternalServerError, "Illegal Servlet request entity, " +
-              "expected length " + contentLength + " but only has length " + bytesRead)
+      /**
+       * Fill buffer with input data.
+       */
+      def onDataAvailable() {
+        try {
+          buffer.fill(inputStream)
+        } catch {
+          case e: RequestProcessingException ⇒ {
             log.error(e, "Could not read request entity")
             promise.complete(new scala.util.Failure[HttpRequest](e))
-            inputStream.close()
+          }
+          case e: IOException ⇒ {
+            val rpe = new RequestProcessingException(InternalServerError, "Could not read request entity")
+            log.error(e, "Could not read request entity")
+            promise.complete(new scala.util.Failure[HttpRequest](rpe))
           }
         }
       }
 
-      def fillRightBuffer() {
-        while (inputStream.isReady) {
-          buf.right.get.write(inputStream.read())
-        }
-      }
-
-      def onDataAvailable() {
-        try {
-          if (buf.isLeft) fillLeftBuffer() else fillRightBuffer()
-        } catch {
-          case e: IOException ⇒
-            log.error(e, "Could not read request entity")
-            promise.complete(new scala.util.Failure[HttpRequest](new RequestProcessingException(InternalServerError, "Could not read request entity")))
-        }
-      }
-
-      def getBuffer = if (buf.isLeft) buf.left.get else buf.right.get.toByteArray
-
+      /**
+       * Fulfill promise as success.
+       */
       def onAllDataRead() {
         try {
           val request = HttpRequest(
             method = toHttpMethod(hsRequest.getMethod),
             uri = rebuildUri(hsRequest),
             headers = addRemoteAddressHeader(hsRequest, rawHeaders),
-            entity = toHttpEntity(getBuffer, contentType),
+            entity = toHttpEntity(buffer.getBuffer, contentType),
             protocol = toHttpProtocol(hsRequest.getProtocol))
             promise.complete(new scala.util.Success(request))
         } catch {
@@ -101,6 +86,10 @@ private[servlet31] object ModelConverter {
         }
       }
 
+      /**
+       * Fulfill promise as failure.
+       * @param t set the promise failure to this throwable.
+       */
       def onError(t: Throwable) {
         promise.complete(new scala.util.Failure[HttpRequest](t))
       }
@@ -109,7 +98,11 @@ private[servlet31] object ModelConverter {
     promise.future
   }
 
-  def toHttpMethod(name: String) =
+  /**
+   * @param name HTTP method name
+   * @return an HTTPMethod that represents the method with name "name".
+   */
+  private def toHttpMethod(name: String) =
     HttpMethods.getForKey(name)
       .getOrElse(throw new IllegalRequestException(MethodNotAllowed, ErrorInfo("Illegal HTTP method", name)))
 
@@ -131,16 +124,82 @@ private[servlet31] object ModelConverter {
     }
   }
 
-  def addRemoteAddressHeader(hsr: HttpServletRequest, headers: List[HttpHeader])(implicit settings: ConnectorSettings): List[HttpHeader] =
+  private def addRemoteAddressHeader(hsr: HttpServletRequest, headers: List[HttpHeader])
+                                    (implicit settings: ConnectorSettings): List[HttpHeader] =
     if (settings.remoteAddressHeader) `Remote-Address`(hsr.getRemoteAddr) :: headers
     else headers
 
-  def toHttpProtocol(name: String) =
+  /**
+   * @param name HTTP protocol name
+   * @return an HTTPProtocol that represents the protocol with name "name".
+   */
+  private def toHttpProtocol(name: String) =
     HttpProtocols.getForKey(name)
       .getOrElse(throw new IllegalRequestException(BadRequest, ErrorInfo("Illegal HTTP protocol", name)))
 
-  def toHttpEntity(buf: Array[Byte], contentType: Option[ContentType]): HttpEntity = {
+  private def toHttpEntity(buf: Array[Byte], contentType: Option[ContentType]): HttpEntity = {
     if (contentType.isEmpty) HttpEntity(buf) else HttpEntity(contentType.get, buf)
   }
 
+  /**
+   * Buffer trait to save input data from the request into memory.
+   */
+  private sealed trait Buffer {
+
+    /**
+     * Fill this buffer with data obtained from a stream.
+     * @param inputStream stream to get the data from.
+     */
+    def fill(inputStream: ServletInputStream)
+
+    /**
+     * @return the data that this buffer holds.
+     */
+    def getBuffer: Array[Byte]
+  }
+
+  /**
+   * A Buffer that holds data whose length has been preset.
+   * @param contentLength the length of the data to hold.
+   */
+  private final class StaticBuffer(contentLength: Int) extends Buffer {
+
+    val buf = new Array[Byte](contentLength)
+
+    var bytesRead: AtomicInteger = new AtomicInteger(0)
+
+    def fill(inputStream: ServletInputStream) {
+      var bytesReadInt = bytesRead.get()
+      while (inputStream.isReady) {
+        buf(bytesRead.get) = inputStream.read().toByte
+        bytesReadInt = bytesReadInt + 1
+        if (bytesReadInt > contentLength) {
+          inputStream.close()
+          val e = new RequestProcessingException(InternalServerError, "Illegal Servlet request entity, " +
+            "expected length " + contentLength + " but only has length " + bytesReadInt)
+          throw e
+        } else {
+          bytesRead.set(bytesReadInt)
+        }
+      }
+    }
+
+    def getBuffer = buf
+  }
+
+  /**
+   * A Buffer that grows on demand to hold data.
+   */
+  private final class DynamicBuffer extends Buffer {
+
+    val baos = new ByteArrayOutputStream()
+
+    def fill(inputStream: ServletInputStream) {
+      while (inputStream.isReady) {
+        baos.write(inputStream.read())
+      }
+    }
+
+    def getBuffer = baos.toByteArray
+  }
 }
